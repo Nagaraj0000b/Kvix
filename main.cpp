@@ -7,6 +7,144 @@
 #include <stdlib.h>
 #include <cerrno>
 #include <fcntl.h> // fcntl, O_NONBLOCK
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <cctype> // toupper
+using namespace std;
+
+// ---- RESP parser (from test.cpp) ----
+// Plain ints instead of an enum - simpler, same idea:
+const int PARSE_INCOMPLETE = 0;      // not enough bytes yet, wait for more data
+const int PARSE_COMPLETE = 1;        // got a full command
+const int PARSE_PROTOCOL_ERROR = 2;  // buffer doesn't look like valid RESP
+
+struct ParseResult {
+    int status;
+    vector<string> args;   // filled only if status == PARSE_COMPLETE
+    size_t bytesConsumed;  // how much to erase from the front of the buffer, if COMPLETE
+};
+
+// Given the raw bytes received so far for one connection, try to pull ONE
+// complete RESP command (an array of bulk strings) out of the front of it.
+ParseResult tryParseCommand(const string& buf) {
+    ParseResult result;
+    result.status = PARSE_INCOMPLETE;
+    result.bytesConsumed = 0;
+
+    if (buf.size() < 1) {
+        return result;  // nothing arrived yet
+    }
+    if (buf[0] != '*') {
+        result.status = PARSE_PROTOCOL_ERROR;
+        return result;
+    }
+
+    // ---- parse "*<argc>\r\n" ----
+    size_t lineEnd = buf.find("\r\n", 0);
+    if (lineEnd == string::npos) {
+        return result;  // haven't seen the end of the first line yet
+    }
+    string countStr = buf.substr(1, lineEnd - 1);  // between '*' and "\r\n"
+    int argc = stoi(countStr);
+
+    size_t pos = lineEnd + 2;  // cursor: move past "*3\r\n"
+    vector<string> args;
+
+    // ---- parse each "$<len>\r\n<data>\r\n" element ----
+    for (int i = 0; i < argc; i++) {
+        if (pos >= buf.size()) {
+            return result;  // ran out of buffer before seeing '$'
+        }
+        if (buf[pos] != '$') {
+            result.status = PARSE_PROTOCOL_ERROR;
+            return result;
+        }
+
+        size_t lenLineEnd = buf.find("\r\n", pos);
+        if (lenLineEnd == string::npos) {
+            return result;  // length line not finished yet
+        }
+        string lenStr = buf.substr(pos + 1, lenLineEnd - (pos + 1));
+        int len = stoi(lenStr);
+
+        pos = lenLineEnd + 2;  // cursor: move past "$3\r\n"
+
+        // need `len` data bytes plus a trailing "\r\n"
+        if (buf.size() < pos + len + 2) {
+            return result;  // data not fully arrived yet
+        }
+
+        string value = buf.substr(pos, len);
+        if (buf[pos + len] != '\r' || buf[pos + len + 1] != '\n') {
+            result.status = PARSE_PROTOCOL_ERROR;
+            return result;
+        }
+
+        args.push_back(value);
+        pos = pos + len + 2;  // move past the value and its trailing "\r\n"
+    }
+
+    // ---- all argc elements parsed successfully ----
+    result.status = PARSE_COMPLETE;
+    result.args = args;
+    result.bytesConsumed = pos;
+    return result;
+}
+
+// ---- command dispatch ----
+// One global hash map is the whole storage engine for now (Week 2 adds
+// TTL/LRU on top of this same idea).
+unordered_map<string, string> store;
+
+// Uppercase a copy of a string, so "set"/"SET"/"Set" all dispatch the same way.
+string toUpper(const string& s) {
+    string out = s;
+    for (size_t i = 0; i < out.size(); i++) {
+        out[i] = toupper((unsigned char)out[i]);
+    }
+    return out;
+}
+
+// Takes the parsed command (args[0] = command name, rest = arguments) and
+// returns the RESP-encoded reply to write back to the client.
+string handleCommand(vector<string>& args) {
+    string cmd = toUpper(args[0]);
+
+    if (cmd == "PING") {
+        return "+PONG\r\n";
+    }
+
+    if (cmd == "SET") {
+        if (args.size() != 3) {
+            return "-ERR wrong number of arguments for 'set' command\r\n";
+        }
+        store[args[1]] = args[2];
+        return "+OK\r\n";
+    }
+
+    if (cmd == "GET") {
+        if (args.size() != 2) {
+            return "-ERR wrong number of arguments for 'get' command\r\n";
+        }
+        unordered_map<string, string>::iterator it = store.find(args[1]);
+        if (it == store.end()) {
+            return "$-1\r\n"; // RESP nil - key not found
+        }
+        string& value = it->second;
+        return "$" + to_string(value.size()) + "\r\n" + value + "\r\n";
+    }
+
+    if (cmd == "DEL") {
+        if (args.size() != 2) {
+            return "-ERR wrong number of arguments for 'del' command\r\n";
+        }
+        size_t removed = store.erase(args[1]);
+        return ":" + to_string(removed) + "\r\n";
+    }
+
+    return "-ERR unknown command '" + args[0] + "'\r\n";
+}
 
 // Flip a fd into non-blocking mode.
 // Needed for server_fd AND every client_fd, so pulled into a helper
@@ -53,22 +191,17 @@ int main()
         exit(1);
     }
 
-    // CHANGED: server_fd is now non-blocking.
-    // Reasoning: epoll_wait() saying "server_fd is ready" means a
-    // connection *was* pending, but by the time we call accept() it
-    // could theoretically be gone (e.g. client disconnected instantly).
-    // A blocking server_fd would then freeze the whole loop for every
-    // other client. Non-blocking + checking for EAGAIN makes that safe.
+    // server_fd is non-blocking so a stale/gone connection can never
+    // freeze the whole loop for every other client.
     if (!setNonBlocking(server_fd))
     {
         perror("fcntl failed");
         exit(1);
     }
 
-    // CHANGED: create the epoll instance.
-    // Reasoning: epoll is a kernel-side watch list. Instead of blocking
-    // on one fd at a time (accept() then read()), we ask the kernel once
-    // per loop iteration "which of ALL my watched fds are ready?".
+    // epoll is a kernel-side watch list. Instead of blocking on one fd at
+    // a time (accept() then read()), we ask the kernel once per loop
+    // iteration "which of ALL my watched fds are ready?".
     int epfd = epoll_create1(0);
     if (epfd == -1)
     {
@@ -76,10 +209,9 @@ int main()
         exit(1);
     }
 
-    // CHANGED: register server_fd with epoll so we're notified when a
-    // new client wants to connect.
-    // Reasoning: EPOLLIN on a *listening* socket means "a connection is
-    // waiting in the accept queue", not "data to read".
+    // register server_fd with epoll so we're notified when a new client
+    // wants to connect. Ready here means "a connection is waiting in the
+    // accept queue", not "data to read".
     epoll_event ev{};
     ev.events = EPOLLIN;
     ev.data.fd = server_fd;
@@ -93,14 +225,18 @@ int main()
 
     const int MAX_EVENTS = 64;
     epoll_event events[MAX_EVENTS];
-    char buf[1024];
+    char readBuf[1024];
 
-    // CHANGED: this replaces the old "accept() then block in an inner
-    // read/write loop for that one client" structure entirely.
-    // Reasoning: there's no per-client blocking section anymore. Every
-    // fd - listening or client - is handled the same way: wait for epoll
-    // to say it's ready, handle only that fd, go back to waiting. That's
-    // what lets a single thread serve many clients: no one fd can hog it.
+    // CHANGED: one buffer per client fd, holding whatever bytes have
+    // arrived for that client but haven't formed a complete RESP command
+    // yet. Reasoning: a client's command can arrive split across more
+    // than one read() - this is the state that survives between reads.
+    unordered_map<int, string> clientBuffers;
+
+    // Every fd - listening or client - is handled the same way: wait for
+    // epoll to say it's ready, handle only that fd, go back to waiting.
+    // That's what lets a single thread serve many clients: no one fd can
+    // hog the thread.
     while (true)
     {
         // -1 timeout = block here. This is the ONLY blocking call left,
@@ -118,11 +254,8 @@ int main()
 
             if (fd == server_fd)
             {
-                // CHANGED: drain ALL pending connections, not just one.
-                // Reasoning: epoll_wait only told us "ready" - there could
-                // be several queued. Accepting just once per notification
-                // would leave others waiting until some unrelated event
-                // happened to wake the loop again.
+                // drain ALL pending connections, not just one - epoll_wait
+                // only told us "ready", there could be several queued.
                 while (true)
                 {
                     sockaddr_in client_addr{};
@@ -147,26 +280,60 @@ int main()
                     cev.data.fd = client_fd;
                     epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cev);
 
+                    // CHANGED: give this new client an empty buffer to
+                    // accumulate into.
+                    clientBuffers[client_fd] = "";
+
                     printf("client connected (fd=%d)\n", client_fd);
                 }
             }
             else
             {
-                // CHANGED: a specific client fd has data. Handle just
-                // this one client, then return to epoll_wait - we do NOT
-                // sit here echoing forever like the old inner loop did.
+                // a specific client fd has data. Handle just this one
+                // client, then return to epoll_wait - never sit here
+                // serving one client forever.
                 bool clientClosed = false;
 
-                // Drain this client's data until EAGAIN. Level-triggered
-                // epoll would keep re-notifying if we left data unread,
-                // but draining now is simpler and cheaper than relying
-                // on repeated wakeups.
+                // Drain this client's data until EAGAIN.
                 while (true)
                 {
-                    ssize_t r = read(fd, buf, sizeof(buf));
+                    ssize_t r = read(fd, readBuf, sizeof(readBuf));
                     if (r > 0)
                     {
-                        write(fd, buf, r); // echo back
+                        // CHANGED: append raw bytes to this client's
+                        // buffer instead of echoing them back directly.
+                        clientBuffers[fd].append(readBuf, r);
+
+                        // CHANGED: try to pull as many complete commands
+                        // out of the buffer as are currently sitting in
+                        // it - there could be more than one queued up.
+                        while (true)
+                        {
+                            ParseResult pr = tryParseCommand(clientBuffers[fd]);
+
+                            if (pr.status == PARSE_INCOMPLETE)
+                            {
+                                break; // wait for more bytes on the next read()
+                            }
+
+                            if (pr.status == PARSE_PROTOCOL_ERROR)
+                            {
+                                string err = "-ERR protocol error\r\n";
+                                write(fd, err.c_str(), err.size());
+                                clientClosed = true;
+                                break;
+                            }
+
+                            // PARSE_COMPLETE: consume it and dispatch.
+                            clientBuffers[fd].erase(0, pr.bytesConsumed);
+                            string reply = handleCommand(pr.args);
+                            write(fd, reply.c_str(), reply.size());
+                        }
+
+                        if (clientClosed)
+                        {
+                            break; // stop reading more from this fd
+                        }
                     }
                     else if (r == 0)
                     {
@@ -189,13 +356,15 @@ int main()
 
                 if (clientClosed)
                 {
-                    // CHANGED: remove from epoll BEFORE close().
-                    // Reasoning: once closed, a fd number can be reused
-                    // instantly by a brand new connection. Deleting from
-                    // epoll after close (or worse, after it's been reused)
-                    // risks operating on the wrong fd's epoll registration.
+                    // remove from epoll BEFORE close() - once closed, a fd
+                    // number can be reused instantly by a brand new
+                    // connection, so this order avoids operating on the
+                    // wrong fd's epoll registration.
                     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                     close(fd);
+                    // CHANGED: also drop this client's buffer, or it
+                    // leaks in clientBuffers forever after disconnect.
+                    clientBuffers.erase(fd);
                 }
             }
         }

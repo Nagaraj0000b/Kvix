@@ -132,15 +132,97 @@ not to reach for the most modern idiom available.
 
 ---
 
+## Milestone 4 — RESP parser wired into the epoll server (redis-cli works)
+
+**Built (`main.cpp`):** `tryParseCommand` from Milestone 3 moved into the
+server and connected to a real hash map (`unordered_map<string, string>
+store`) plus a dispatcher (`handleCommand`) for `PING`/`SET`/`GET`/`DEL`.
+
+Two pieces of new state needed for this to work correctly:
+- `unordered_map<int, string> clientBuffers` — one persistent buffer per
+  client fd, since a command can arrive split across more than one
+  `read()`. This is what `tryParseCommand`'s `PARSE_INCOMPLETE` result was
+  built for back in Milestone 3.
+- In the client-read branch of the epoll loop: incoming bytes are now
+  appended to `clientBuffers[fd]` instead of being echoed straight back.
+  Then a loop repeatedly calls `tryParseCommand` on that buffer — handling
+  `PARSE_COMPLETE` by dispatching + replying + erasing the consumed bytes,
+  and looping again in case a second full command is already queued up
+  behind the first. `PARSE_INCOMPLETE` breaks out to wait for the next
+  `read()`; `PARSE_PROTOCOL_ERROR` replies `-ERR protocol error\r\n` and
+  closes the connection.
+
+**Command replies (RESP-correct):**
+- `PING` → `+PONG\r\n`
+- `SET key value` → stores it, `+OK\r\n`
+- `GET key` → `$<len>\r\n<value>\r\n`, or RESP nil `$-1\r\n` if missing
+  (deliberately *not* an empty bulk string `$0\r\n\r\n` — those mean
+  different things to a real RESP client)
+- `DEL key` → `:1\r\n` if it existed, `:0\r\n` if it didn't
+- unknown command → `-ERR unknown command '<name>'\r\n`
+
+**Also fixed:** `clientBuffers.erase(fd)` added to the disconnect cleanup
+path, alongside the existing `epoll_ctl(EPOLL_CTL_DEL)` + `close(fd)` —
+otherwise every disconnected client leaks a stale buffer entry forever.
+
+**Gotcha hit while testing:** a stale server process from earlier
+echo-server testing was still bound to port 6380 in the background. The
+first test run showed raw bytes echoed straight back unprocessed — looked
+like the new dispatch code wasn't working, but it was actually just an old
+binary still listening. Lesson: check `ss -ltnp | grep 6380` (or
+`pkill -f ./cppcache`) before trusting a test result after rebuilding.
+
+**Verified** with real `redis-cli`:
+```
+redis-cli -p 6380 ping        -> PONG
+redis-cli -p 6380 set k v     -> OK
+redis-cli -p 6380 get k       -> "v"
+redis-cli -p 6380 del k       -> (integer) 1
+redis-cli -p 6380 get k       -> (nil)
+```
+Also confirmed two `redis-cli` clients can run concurrently without
+blocking each other — the epoll milestone still holds under the new logic.
+
+---
+
+## How to build and run
+
+```
+g++ -std=c++17 -Wall main.cpp -o cppcache
+./cppcache
+```
+Leave that running in one terminal. In a second terminal:
+```
+redis-cli -p 6380 ping
+redis-cli -p 6380 set k v
+redis-cli -p 6380 get k
+redis-cli -p 6380 del k
+redis-cli -p 6380 get k
+```
+(install redis-cli first if needed: `sudo apt-get install -y redis-tools`)
+
+Or, without installing anything, raw RESP bytes over `nc`:
+```
+printf '*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n' | nc localhost 6380
+```
+
+To run the standalone RESP parser tests (no server involved):
+```
+g++ -std=c++17 -Wall test.cpp -o test_resp
+./test_resp
+```
+
+If a server run seems stuck on stale behavior after a rebuild, check
+nothing old is still bound to the port:
+```
+ss -ltnp | grep 6380
+pkill -f ./cppcache
+```
+
+---
+
 ## Next up
 
-Wire `tryParseCommand` into the epoll server: give each client fd a
-persistent `string` buffer (state that survives across multiple `read()`
-calls, not just the local `char buf[1024]` used for echoing), append
-incoming bytes to it, loop calling `tryParseCommand` and dispatching
-`PING`/`SET`/`GET`/`DEL` against a hash map whenever it returns
-`PARSE_COMPLETE`, then erase `bytesConsumed` bytes and check again in case
-another full command is already queued up behind it.
-
-Milestone: `redis-cli -p 6380 set k v` and `redis-cli -p 6380 get k` work
-against the server.
+Week 2 (per blueprint): TTL / `EXPIRE` / `TTL` (lazy + active expiry), LRU
+eviction with a memory cap, `INCR`/`EXISTS`/`KEYS`/`FLUSHALL`, and starting
+GoogleTest for the parser, store, and LRU.

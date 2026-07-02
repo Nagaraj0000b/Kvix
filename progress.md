@@ -287,9 +287,69 @@ set k2 v2 (no expire) ; ttl k2 -> (integer) -1
 
 ---
 
+## Milestone 6 — LRU eviction (O(1) access + evict)
+
+**Built (`main.cpp`):** a fixed-size cap on the store; inserting a new key
+once full evicts the least-recently-used key first.
+
+**Data structure:**
+```cpp
+struct Entry {
+    string value;
+    long long expireAt;
+    list<string>::iterator lruIt;  // this key's node inside lruList
+};
+unordered_map<string, Entry> store;
+list<string> lruList;              // front = most recently used, back = least
+const size_t MAX_KEYS = 5;         // small on purpose - makes eviction observable manually
+```
+
+**Why `list<string>::iterator` gives O(1) instead of O(n):** `std::list` is
+a doubly linked list, and an iterator into it is a direct handle to one
+specific node (not a searchable position like a `vector` index). Because
+each `Entry` caches its own node's iterator, moving a key to the front or
+removing it (`lruList.erase(it)`) never has to scan the list looking for a
+match — it already knows exactly where that key lives. This only works
+because `std::list` guarantees other iterators stay valid when you
+insert/erase elsewhere in the list (unlike `vector`, where that would
+shift things and invalidate iterators/indices past the change).
+
+**The two helpers:**
+- `touch(key)` — marks a key as most-recently-used: erase its current
+  node from `lruList`, push it to the front, update its cached iterator.
+  Called on every `SET` of an existing key and every successful `GET`
+  (reads count as "used" too, not just writes).
+- `evictIfFull()` — called only when `SET` is about to insert a *brand
+  new* key: if `store.size() >= MAX_KEYS`, take `lruList.back()` (the
+  actual least-recently-used key), erase it from both `store` and
+  `lruList`, making room before inserting the new one.
+
+**Bug caught before it shipped:** `sweepExpiredKeys()` (the active TTL
+sweep from Milestone 5) was erasing expired keys from `store` but not from
+`lruList` — that would have left `lruList` holding stale keys no longer in
+`store`, and `evictIfFull()` could then try to evict a key that was
+already gone. Fixed by erasing from `lruList` (via the entry's `lruIt`)
+alongside the `store` erase in the sweep, matching what `GET`'s lazy-expiry
+path and `DEL` already do.
+
+**Simplification, documented on purpose:** the cap counts *number of
+keys*, not actual memory/byte-size like real Redis's `maxmemory`. Tracking
+true byte usage would mean summing key+value lengths on every mutation;
+counting keys is a fair, defensible simplification for a project at this
+stage (interview Q10 territory again).
+
+**Verified**, with `MAX_KEYS = 5`:
+```
+set a 1 / b 2 / c 3 / d 4 / e 5   -> all OK, store now at cap (5 keys)
+get a                              -> "1"   (touches 'a' - now most recently used)
+set f 6                            -> OK    (triggers eviction of the actual LRU key)
+get a                              -> "1"   (survived - was touched right before eviction)
+get b                              -> (nil) (evicted - was LRU after 'a' got touched)
+```
+
+---
+
 ## Next up
 
-Week 2 continued (per blueprint): LRU eviction with a memory cap
-(`unordered_map` + `std::list`, O(1) access/evict), then
-`INCR`/`EXISTS`/`KEYS`/`FLUSHALL`, then starting GoogleTest for the
-parser, store, and LRU.
+Week 2 remaining (per blueprint): `INCR`/`EXISTS`/`KEYS`/`FLUSHALL`, then
+starting GoogleTest for the parser, store, and LRU.

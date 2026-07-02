@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <cctype> // toupper
 #include <ctime>  // time()
+#include <list>   // list<string> for LRU recency order
 using namespace std;
 
 // ---- RESP parser (from test.cpp) ----
@@ -97,14 +98,44 @@ ParseResult tryParseCommand(const string& buf) {
 // Each stored key now carries an expiry alongside its value.
 // expireAt == 0 means "never expires"; otherwise it's a unix timestamp
 // (seconds) - the key is expired once time(nullptr) >= expireAt.
+//
+// lruIt points at this key's node inside lruList (below), so it can be
+// moved to the front or erased in O(1) - no searching the list needed.
 struct Entry {
     string value;
     long long expireAt;
+    list<string>::iterator lruIt;
 };
 unordered_map<string, Entry> store;
 
+// front = most recently used, back = least recently used.
+list<string> lruList;
+
+// Small cap on purpose, so eviction is actually observable while testing
+// manually. Counting keys instead of real byte-size memory usage is a
+// documented simplification - see progress.md.
+const size_t MAX_KEYS = 5;
+
 bool isExpired(const Entry& e) {
     return e.expireAt != 0 && time(nullptr) >= e.expireAt;
+}
+
+// Mark a key as most-recently-used: move its node to the front of lruList.
+void touch(const string& key) {
+    lruList.erase(store[key].lruIt);
+    lruList.push_front(key);
+    store[key].lruIt = lruList.begin();
+}
+
+// If we're at the key-count cap, evict the least-recently-used key
+// (the one at the back of lruList) to make room for a new key.
+void evictIfFull() {
+    if (store.size() < MAX_KEYS) {
+        return;
+    }
+    string lruKey = lruList.back();
+    store.erase(lruKey);
+    lruList.pop_back();
 }
 
 // Uppercase a copy of a string, so "set"/"SET"/"Set" all dispatch the same way.
@@ -129,10 +160,27 @@ string handleCommand(vector<string>& args) {
         if (args.size() != 3) {
             return "-ERR wrong number of arguments for 'set' command\r\n";
         }
-        Entry e;
-        e.value = args[2];
-        e.expireAt = 0; // a plain SET always clears any previous TTL
-        store[args[1]] = e;
+        string& key = args[1];
+
+        if (store.find(key) == store.end()) {
+            // brand-new key: make room first if we're at the cap, then
+            // insert it at the front of the recency list.
+            evictIfFull();
+
+            Entry e;
+            e.value = args[2];
+            e.expireAt = 0;
+            lruList.push_front(key);
+            e.lruIt = lruList.begin();
+            store[key] = e;
+        } else {
+            // existing key: update value, clear any old TTL, and mark
+            // as most-recently-used since it was just written to.
+            store[key].value = args[2];
+            store[key].expireAt = 0;
+            touch(key);
+        }
+
         return "+OK\r\n";
     }
 
@@ -146,10 +194,12 @@ string handleCommand(vector<string>& args) {
         }
         // lazy expiration: check on access, delete if stale
         if (isExpired(it->second)) {
+            lruList.erase(it->second.lruIt);
             store.erase(it);
             return "$-1\r\n";
         }
-        string& value = it->second.value;
+        touch(args[1]); // a read counts as "used" too
+        string& value = store[args[1]].value;
         return "$" + to_string(value.size()) + "\r\n" + value + "\r\n";
     }
 
@@ -157,8 +207,13 @@ string handleCommand(vector<string>& args) {
         if (args.size() != 2) {
             return "-ERR wrong number of arguments for 'del' command\r\n";
         }
-        size_t removed = store.erase(args[1]);
-        return ":" + to_string(removed) + "\r\n";
+        unordered_map<string, Entry>::iterator it = store.find(args[1]);
+        if (it == store.end()) {
+            return ":0\r\n";
+        }
+        lruList.erase(it->second.lruIt);
+        store.erase(it);
+        return ":1\r\n";
     }
 
     if (cmd == "EXPIRE") {
@@ -200,6 +255,7 @@ void sweepExpiredKeys() {
     for (unordered_map<string, Entry>::iterator it = store.begin(); it != store.end(); )
     {
         if (isExpired(it->second)) {
+            lruList.erase(it->second.lruIt);
             it = store.erase(it);
         } else {
             ++it;

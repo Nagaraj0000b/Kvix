@@ -221,8 +221,75 @@ pkill -f ./cppcache
 
 ---
 
+## Milestone 5 — TTL / expiry (lazy + active)
+
+**Built (`main.cpp`):** keys can now carry an expiry. `store`'s value type
+changed from plain `string` to:
+```cpp
+struct Entry {
+    string value;
+    long long expireAt;  // 0 = never expires; otherwise a unix timestamp (seconds)
+};
+```
+plus one shared check used everywhere: `isExpired(entry)` →
+`expireAt != 0 && time(nullptr) >= expireAt`.
+
+**New commands:**
+- `EXPIRE key seconds` → sets `expireAt = time(nullptr) + seconds` on an
+  existing key, `:1\r\n`; `:0\r\n` if the key doesn't exist.
+- `TTL key` → `:-2\r\n` if the key doesn't exist, `:-1\r\n` if it exists
+  but has no TTL set, otherwise the remaining seconds as `:N\r\n`.
+- `SET` now always resets `expireAt` back to `0`, so a stale TTL from a
+  previous `SET` on the same key can't silently linger.
+
+**Lazy expiration:** a key isn't removed the instant its TTL hits zero —
+it just sits there until something reads it. `GET` checks `isExpired()`
+before returning a value; if true, it erases the key right there and
+replies nil instead. The delete only happens at the moment of access.
+
+**Active expiration:** a periodic sweep (`sweepExpiredKeys()`) removes
+expired keys even if nobody reads them again — otherwise dead keys with
+no future access would sit in memory forever. This rides on the existing
+epoll loop instead of a separate thread/timer: `epoll_wait`'s timeout
+changed from `-1` (block forever) to `1000` ms, and whenever it returns
+`0` (timed out, nothing was ready), that's the cue to sweep. Real Redis
+samples random keys instead of a full scan, to stay cheap at millions of
+keys — a full scan here is a documented simplification, fine at this
+project's scale (interview Q10: "how is this different from real Redis").
+
+**Why both, not just one:** lazy alone leaks memory for keys nobody reads
+again; active alone (if it were the only mechanism) means scanning
+constantly even when nothing expired. Together: reads stay cheap (lazy
+catches the common case for free on access), and the periodic sweep mops
+up the leftover "cold" keys nobody asked about.
+
+**Non-bug hit while testing:** manually typing `set k v` / `expire k 2` /
+`get k` as separate `redis-cli` invocations, `get k` sometimes came back
+`(nil)` immediately, looking like a bug. It wasn't — confirmed by firing
+the same sequence back-to-back with no typing delay (`SET`→`EXPIRE k
+2`→`GET k` returned `v`, `TTL k` returned `2` correctly). A 2-second TTL
+is shorter than the real time it takes to read output, retype, and let
+`redis-cli` pay its per-invocation process-startup + TCP-connect cost —
+the key really had expired for real by the time the next command landed.
+Lesson: use a longer TTL (10-15s) for comfortable manual testing.
+
+**Verified:**
+```
+set k v            -> OK
+expire k 2          -> (integer) 1
+ttl k               -> (integer) 2  (immediately after, no delay)
+get k               -> "v"          (immediately after, no delay)
+... wait past the TTL ...
+get k               -> (nil)
+ttl k               -> (integer) -2
+set k2 v2 (no expire) ; ttl k2 -> (integer) -1
+```
+
+---
+
 ## Next up
 
-Week 2 (per blueprint): TTL / `EXPIRE` / `TTL` (lazy + active expiry), LRU
-eviction with a memory cap, `INCR`/`EXISTS`/`KEYS`/`FLUSHALL`, and starting
-GoogleTest for the parser, store, and LRU.
+Week 2 continued (per blueprint): LRU eviction with a memory cap
+(`unordered_map` + `std::list`, O(1) access/evict), then
+`INCR`/`EXISTS`/`KEYS`/`FLUSHALL`, then starting GoogleTest for the
+parser, store, and LRU.

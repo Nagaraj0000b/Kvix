@@ -11,6 +11,7 @@
 #include <vector>
 #include <unordered_map>
 #include <cctype> // toupper
+#include <ctime>  // time()
 using namespace std;
 
 // ---- RESP parser (from test.cpp) ----
@@ -93,9 +94,18 @@ ParseResult tryParseCommand(const string& buf) {
 }
 
 // ---- command dispatch ----
-// One global hash map is the whole storage engine for now (Week 2 adds
-// TTL/LRU on top of this same idea).
-unordered_map<string, string> store;
+// Each stored key now carries an expiry alongside its value.
+// expireAt == 0 means "never expires"; otherwise it's a unix timestamp
+// (seconds) - the key is expired once time(nullptr) >= expireAt.
+struct Entry {
+    string value;
+    long long expireAt;
+};
+unordered_map<string, Entry> store;
+
+bool isExpired(const Entry& e) {
+    return e.expireAt != 0 && time(nullptr) >= e.expireAt;
+}
 
 // Uppercase a copy of a string, so "set"/"SET"/"Set" all dispatch the same way.
 string toUpper(const string& s) {
@@ -119,7 +129,10 @@ string handleCommand(vector<string>& args) {
         if (args.size() != 3) {
             return "-ERR wrong number of arguments for 'set' command\r\n";
         }
-        store[args[1]] = args[2];
+        Entry e;
+        e.value = args[2];
+        e.expireAt = 0; // a plain SET always clears any previous TTL
+        store[args[1]] = e;
         return "+OK\r\n";
     }
 
@@ -127,11 +140,16 @@ string handleCommand(vector<string>& args) {
         if (args.size() != 2) {
             return "-ERR wrong number of arguments for 'get' command\r\n";
         }
-        unordered_map<string, string>::iterator it = store.find(args[1]);
+        unordered_map<string, Entry>::iterator it = store.find(args[1]);
         if (it == store.end()) {
             return "$-1\r\n"; // RESP nil - key not found
         }
-        string& value = it->second;
+        // lazy expiration: check on access, delete if stale
+        if (isExpired(it->second)) {
+            store.erase(it);
+            return "$-1\r\n";
+        }
+        string& value = it->second.value;
         return "$" + to_string(value.size()) + "\r\n" + value + "\r\n";
     }
 
@@ -143,7 +161,50 @@ string handleCommand(vector<string>& args) {
         return ":" + to_string(removed) + "\r\n";
     }
 
+    if (cmd == "EXPIRE") {
+        if (args.size() != 3) {
+            return "-ERR wrong number of arguments for 'expire' command\r\n";
+        }
+        unordered_map<string, Entry>::iterator it = store.find(args[1]);
+        if (it == store.end() || isExpired(it->second)) {
+            return ":0\r\n";
+        }
+        long long seconds = stoll(args[2]);
+        it->second.expireAt = time(nullptr) + seconds;
+        return ":1\r\n";
+    }
+
+    if (cmd == "TTL") {
+        if (args.size() != 2) {
+            return "-ERR wrong number of arguments for 'ttl' command\r\n";
+        }
+        unordered_map<string, Entry>::iterator it = store.find(args[1]);
+        if (it == store.end() || isExpired(it->second)) {
+            return ":-2\r\n"; // key doesn't exist
+        }
+        if (it->second.expireAt == 0) {
+            return ":-1\r\n"; // exists, but no TTL set
+        }
+        long long remaining = it->second.expireAt - time(nullptr);
+        return ":" + to_string(remaining) + "\r\n";
+    }
+
     return "-ERR unknown command '" + args[0] + "'\r\n";
+}
+
+// Active expiration sweep: called periodically (see epoll_wait timeout in
+// main()) instead of using a timer per key. Full scan is a simplification -
+// real Redis samples random keys instead so this stays cheap at millions
+// of keys, but a full scan is fine at the scale this project runs at.
+void sweepExpiredKeys() {
+    for (unordered_map<string, Entry>::iterator it = store.begin(); it != store.end(); )
+    {
+        if (isExpired(it->second)) {
+            it = store.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 // Flip a fd into non-blocking mode.
@@ -239,12 +300,22 @@ int main()
     // hog the thread.
     while (true)
     {
-        // -1 timeout = block here. This is the ONLY blocking call left,
-        // and it blocks on ALL watched fds at once, not just one.
-        int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+        // CHANGED: timeout is now 1000ms instead of -1 (block forever).
+        // Reasoning: this is the active expiration sweep's clock. If no
+        // fd is ready within 1 second, epoll_wait returns 0 and we use
+        // that wakeup to sweep expired keys - no separate timer/thread
+        // needed, it rides on the same loop.
+        int n = epoll_wait(epfd, events, MAX_EVENTS, 1000);
         if (n == -1)
         {
             perror("epoll_wait failed");
+            continue;
+        }
+
+        if (n == 0)
+        {
+            // timed out, nothing was ready - this is the active expiry tick
+            sweepExpiredKeys();
             continue;
         }
 

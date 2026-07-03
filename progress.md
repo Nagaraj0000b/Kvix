@@ -206,6 +206,13 @@ Or, without installing anything, raw RESP bytes over `nc`:
 printf '*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n' | nc localhost 6380
 ```
 
+> NOTE: as of Milestone 9 the code moved from a single `main.cpp` to the
+> `src/` folder tree. Build with the multi-file command below (or CMake):
+> ```
+> g++ -std=c++17 -Wall -I src $(find src -name '*.cpp') -o cppcache
+> # or:  cmake -B build && cmake --build build
+> ```
+
 To run the standalone RESP parser tests (no server involved):
 ```
 g++ -std=c++17 -Wall test.cpp -o test_resp
@@ -457,12 +464,84 @@ the server mid-run, restart, data survives.
 
 ---
 
+## Milestone 9 — SOLID refactor into the src/ folder structure
+
+**Why:** everything worked as one 600-line `main.cpp`, but the whole point
+of the project is being able to defend the *design*, not just the behavior.
+This splits the monolith into the layered structure from blueprint §6, with
+the **command pattern** as the SOLID centerpiece. No behavior changed - this
+is purely structure. (Blueprint §12 explicitly lists "refactoring toward
+SOLID once logic works" as a delegate-to-Claude task, unlike the core logic
+which had to be written by hand first - which it was, across Milestones 1-8.)
+
+**New layout (each folder = one responsibility - the SRP story):**
+```
+src/
+├── main.cpp                    # 5 lines: build a Server, run it
+├── net/Server.{h,cpp}          # sockets + epoll loop + per-client buffers
+├── protocol/
+│   ├── RespParser.{h,cpp}      # bytes <-> command (tryParseCommand + encodeCommand)
+│   └── RespReply.h             # helpers to build reply bytes (integer(), bulkString(), ...)
+├── command/
+│   ├── Command.h               # abstract base class + CommandContext
+│   ├── CommandRegistry.{h,cpp} # name -> command object; the ONLY dispatcher
+│   └── <One>Command.h          # one class per command (Ping/Set/Get/Del/...11 total)
+├── store/DataStore.{h,cpp}     # the hash map + TTL + LRU, all behind methods
+└── persistence/
+    ├── Aof.{h,cpp}             # append-only log: append/readAllCommands/reset
+    └── Snapshot.{h,cpp}        # full dump save/load
+```
+
+**The command pattern = the Open/Closed Principle in action.** Every command
+is a small class inheriting `Command` with two methods: `run(context, args)`
+returns the reply bytes, `changesData()` says whether it should be logged to
+the AOF. Adding a command = write one new header + add one `registerCommand()`
+line in `CommandRegistry`'s constructor. You never touch the dispatcher or any
+existing command. That's "open for extension, closed for modification" made
+literal - the single strongest interview talking point in the codebase.
+
+**Other SOLID/encapsulation wins from the split:**
+- The `DataStore` class hides the map + `list` + TTL behind named methods
+  (`setValue`, `getTimeToLive`, `incrementValue`, ...). The network and
+  command layers can't touch the internals - they ask, they don't reach in.
+- `RespReply` helpers turned unreadable byte-mashing like
+  `"$" + to_string(v.size()) + "\r\n" + v + "\r\n"` into `RespReply::bulkString(v)`.
+- `CommandContext` bundles `{store, snapshot, aof}` into one thing passed to
+  every command - most only use `store`; `SAVE` uses all three.
+- The old startup-replay / AOF-logging tangle is now clean orchestration in
+  `Server`: `recoverFromDisk()` does snapshot.load -> aof.readAllCommands ->
+  replay (without re-logging) -> aof.openForAppend. Commands never know they're
+  being logged; `processCommand` decides that via `changesData()`.
+
+**Manual memory note (deliberate, interview-relevant):** `CommandRegistry`
+owns each command object - `new`ed in the constructor, `delete`d in the
+destructor. Chose explicit new/delete over `unique_ptr` to keep the ownership
+visible and the syntax beginner-plain, matching the rest of the codebase's
+style. The commands are stateless singletons that live for the whole run.
+
+**Build changed** (many files now): either
+`g++ -std=c++17 -I src $(find src -name '*.cpp') -o cppcache`, or the new
+`CMakeLists.txt` (`cmake -B build && cmake --build build`).
+
+**Verified behavior-identical to the monolith**, all against the refactored
+binary:
+- every command: PING/SET/GET/EXISTS/DEL/INCR/EXPIRE/TTL/KEYS/FLUSHALL +
+  unknown-command error
+- INCR preserves an existing TTL (counter=43 with ttl still 100)
+- LRU: filled to cap, touched `a`, inserted `f` -> `a` survived, `b` evicted
+- crash recovery: snapshot + post-snapshot AOF write, `kill -9`, restart ->
+  all keys back, TTL preserved and correctly counted down
+
+*(`test.cpp` in the repo root still has its own standalone copy of the parser
+and still compiles/runs on its own - left as-is for now; a future cleanup
+could point it at `src/protocol/RespParser` and grow into real unit tests.)*
+
+---
+
 ## Next up
 
-Refactor into the SOLID command-pattern folder structure described in the
-blueprint (§6) if there's time before Week 4, then: benchmark with
-`redis-benchmark` or a custom client, write the README (features,
-architecture diagram, design decisions, benchmarks, "what I'd do next"),
-and pre-write answers to all of §11's interview questions. GoogleTest for
-the parser/store/LRU is still deferred and worth picking up if time
-allows.
+Week 4 harden & prepare (per blueprint): benchmark with `redis-benchmark`
+(record ops/sec), write the README (§10: features, architecture diagram,
+design decisions, benchmarks, "what I'd do next"), and pre-write answers to
+all 12 of §11's interview questions. GoogleTest for the parser/store/LRU is
+still deferred and now easier to add, since each layer is its own unit.

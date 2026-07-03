@@ -244,6 +244,90 @@ string handleCommand(vector<string>& args) {
         return ":" + to_string(remaining) + "\r\n";
     }
 
+    if (cmd == "EXISTS") {
+        if (args.size() != 2) {
+            return "-ERR wrong number of arguments for 'exists' command\r\n";
+        }
+        unordered_map<string, Entry>::iterator it = store.find(args[1]);
+        if (it == store.end()) {
+            return ":0\r\n";
+        }
+        if (isExpired(it->second)) {
+            lruList.erase(it->second.lruIt);
+            store.erase(it);
+            return ":0\r\n";
+        }
+        return ":1\r\n";
+    }
+
+    if (cmd == "INCR") {
+        if (args.size() != 2) {
+            return "-ERR wrong number of arguments for 'incr' command\r\n";
+        }
+        string& key = args[1];
+
+        long long current = 0;
+        unordered_map<string, Entry>::iterator it = store.find(key);
+        bool keyExists = (it != store.end() && !isExpired(it->second));
+
+        if (keyExists) {
+            try {
+                current = stoll(it->second.value);
+            } catch (...) {
+                // existing value isn't a valid integer - untrusted user
+                // input, unlike the RESP parser's stoll calls which only
+                // ever ran on digit fields we already validated ourselves.
+                return "-ERR value is not an integer or out of range\r\n";
+            }
+        }
+
+        long long updated = current + 1;
+        string updatedStr = to_string(updated);
+
+        if (keyExists) {
+            // in-place mutation - does NOT reset expireAt, unlike SET.
+            // A key's TTL should survive an INCR, same as real Redis.
+            it->second.value = updatedStr;
+            touch(key);
+        } else {
+            evictIfFull();
+            Entry e;
+            e.value = updatedStr;
+            e.expireAt = 0;
+            lruList.push_front(key);
+            e.lruIt = lruList.begin();
+            store[key] = e;
+        }
+
+        return ":" + updatedStr + "\r\n";
+    }
+
+    if (cmd == "KEYS") {
+        if (args.size() != 2) {
+            return "-ERR wrong number of arguments for 'keys' command\r\n";
+        }
+        // simplification: only "*" (everything) is supported - real glob
+        // matching (e.g. "user:*") is out of scope for this project.
+        vector<string> matched;
+        for (unordered_map<string, Entry>::iterator it = store.begin(); it != store.end(); ++it) {
+            if (!isExpired(it->second)) {
+                matched.push_back(it->first);
+            }
+        }
+
+        string reply = "*" + to_string(matched.size()) + "\r\n";
+        for (size_t i = 0; i < matched.size(); i++) {
+            reply += "$" + to_string(matched[i].size()) + "\r\n" + matched[i] + "\r\n";
+        }
+        return reply;
+    }
+
+    if (cmd == "FLUSHALL") {
+        store.clear();
+        lruList.clear(); // otherwise lruList would be full of dangling keys
+        return "+OK\r\n";
+    }
+
     return "-ERR unknown command '" + args[0] + "'\r\n";
 }
 

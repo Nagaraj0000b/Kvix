@@ -349,7 +349,53 @@ get b                              -> (nil) (evicted - was LRU after 'a' got tou
 
 ---
 
+## Milestone 7 — INCR / EXISTS / KEYS / FLUSHALL
+
+**Built (`main.cpp`):** the remaining Week 2 commands, added to
+`handleCommand` after `TTL`.
+
+- **`EXISTS key`** — `:1` if the key exists and isn't expired, else `:0`.
+  Made consistent with the other lazy-expiry paths: an expired key it
+  finds gets actually erased from both `store` and `lruList`, not just
+  reported as missing (same pattern `GET`/`DEL`/the sweep already follow).
+
+- **`INCR key`** — first place user-supplied (untrusted) text gets parsed
+  as a number. `stoll()` throws (`std::invalid_argument` /
+  `std::out_of_range`) on non-numeric input, so the parse is wrapped in
+  `try { ... } catch (...) { return "-ERR value is not an integer or out
+  of range\r\n"; }`. This is different from the RESP parser's `stoll`
+  calls, which only ever ran on digit-length fields already validated by
+  construction. Missing key is treated as `"0"` before incrementing.
+  Deliberately does **not** reset `expireAt` the way `SET` does - `INCR`
+  is an in-place mutation of an existing value, not a fresh write, so an
+  existing TTL survives it (matches real Redis behavior).
+
+- **`KEYS pattern`** — simplified to only supporting `KEYS *` (list every
+  live key); real glob matching (`user:*`) is out of scope for this
+  project. This is the **first RESP array reply** written instead of a
+  single-line one: `*N\r\n` followed by each key as a bulk string, the
+  same shape the RESP *parser* already reads on the request side, just
+  built in the write direction.
+
+- **`FLUSHALL`** — `store.clear()` + `lruList.clear()`. Clearing both
+  matters for the same reason as the TTL-sweep bug in Milestone 6: only
+  clearing `store` would leave `lruList` full of dangling keys.
+
+**Verified:**
+```
+set n 10 ; incr n              -> (integer) 11
+exists n / exists ghost        -> (integer) 1 / (integer) 0
+keys *                         -> n
+set notanumber abc ; incr notanumber -> ERR value is not an integer or out of range
+flushall ; keys *              -> empty (*0\r\n at the byte level)
+set n 5 ; expire n 100 ; incr n ; ttl n -> 100 (TTL preserved across INCR)
+```
+
+---
+
 ## Next up
 
-Week 2 remaining (per blueprint): `INCR`/`EXISTS`/`KEYS`/`FLUSHALL`, then
-starting GoogleTest for the parser, store, and LRU.
+Week 3 (per blueprint): persistence — AOF (append-only log of every
+write) + snapshot dump/load, with crash recovery verified by killing the
+server mid-run and restarting. Also: start GoogleTest for the parser,
+store, and LRU (deferred from Week 2).

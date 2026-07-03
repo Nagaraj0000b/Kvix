@@ -2,3 +2,5 @@
 cppcache
 test_resp
 *.o
+cppcache.aof
+cppcache.snapshot

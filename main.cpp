@@ -13,7 +13,11 @@
 #include <cctype> // toupper
 #include <ctime>  // time()
 #include <list>   // list<string> for LRU recency order
+#include <fstream> // AOF + snapshot file I/O
 using namespace std;
+
+const char* AOF_PATH = "cppcache.aof";
+const char* SNAPSHOT_PATH = "cppcache.snapshot";
 
 // ---- RESP parser (from test.cpp) ----
 // Plain ints instead of an enum - simpler, same idea:
@@ -146,6 +150,11 @@ string toUpper(const string& s) {
     }
     return out;
 }
+
+// Forward declaration - defined further down, after sweepExpiredKeys.
+// handleCommand's SAVE case needs it, but it's implemented later in the
+// file alongside the rest of the persistence code.
+void saveSnapshot();
 
 // Takes the parsed command (args[0] = command name, rest = arguments) and
 // returns the RESP-encoded reply to write back to the client.
@@ -328,6 +337,11 @@ string handleCommand(vector<string>& args) {
         return "+OK\r\n";
     }
 
+    if (cmd == "SAVE") {
+        saveSnapshot();
+        return "+OK\r\n";
+    }
+
     return "-ERR unknown command '" + args[0] + "'\r\n";
 }
 
@@ -347,6 +361,125 @@ void sweepExpiredKeys() {
     }
 }
 
+// ---- persistence: AOF + snapshot ----
+
+// Mirror of tryParseCommand: encodes args back into the same RESP
+// array-of-bulk-strings shape. Used for both AOF log entries and
+// snapshot records - one length-prefixed format, both directions.
+string encodeCommand(const vector<string>& args) {
+    string out = "*" + to_string(args.size()) + "\r\n";
+    for (size_t i = 0; i < args.size(); i++) {
+        out += "$" + to_string(args[i].size()) + "\r\n" + args[i] + "\r\n";
+    }
+    return out;
+}
+
+// Only these commands actually mutate the store - only these get logged.
+bool isWriteCommand(const string& cmdUpper) {
+    return cmdUpper == "SET" || cmdUpper == "DEL" || cmdUpper == "EXPIRE" ||
+           cmdUpper == "INCR" || cmdUpper == "FLUSHALL";
+}
+
+FILE* aofFile = nullptr;
+
+// Append this command to the AOF, then force it to physical disk before
+// returning - "always fsync" durability: once the client sees +OK, the
+// write is guaranteed to survive a crash. Slower than batching syncs
+// (real Redis's "everysec" option), but simplest to reason about/verify.
+void logWrite(const vector<string>& args) {
+    if (aofFile == nullptr) {
+        return;
+    }
+    string encoded = encodeCommand(args);
+    fwrite(encoded.data(), 1, encoded.size(), aofFile);
+    fflush(aofFile);
+    fsync(fileno(aofFile));
+}
+
+// Startup recovery, step 2: replay every write command recorded in the
+// AOF since the last snapshot, on top of whatever loadSnapshot() already
+// restored. An AOF file is just the same RESP array shape a client would
+// have sent, end to end - so tryParseCommand reads it exactly the same way.
+//
+// Note: substr()-ing the remaining buffer each iteration is O(n) per
+// command, so this replay is O(n^2) in AOF size overall - a documented
+// simplification, fine for a startup-only replay at this project's scale.
+void replayAof() {
+    ifstream in(AOF_PATH, ios::binary);
+    if (!in.is_open()) {
+        return;
+    }
+    string contents((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    size_t offset = 0;
+    while (offset < contents.size()) {
+        string remaining = contents.substr(offset);
+        ParseResult pr = tryParseCommand(remaining);
+        if (pr.status != PARSE_COMPLETE) {
+            break; // incomplete/corrupt tail - stop replaying
+        }
+        handleCommand(pr.args); // rebuild state; reply has nobody to go to
+        offset += pr.bytesConsumed;
+    }
+}
+
+// Full dump of current state to disk: one RESP array per live key,
+// shaped [key, value, expireAt-as-string]. Then truncates the AOF -
+// the snapshot now covers everything up to this point, so old AOF
+// entries would just be replayed redundantly on top of it.
+void saveSnapshot() {
+    ofstream out(SNAPSHOT_PATH, ios::binary | ios::trunc);
+    for (unordered_map<string, Entry>::iterator it = store.begin(); it != store.end(); ++it) {
+        if (isExpired(it->second)) {
+            continue; // don't bother saving keys that are already dead
+        }
+        vector<string> record;
+        record.push_back(it->first);
+        record.push_back(it->second.value);
+        record.push_back(to_string(it->second.expireAt));
+        out << encodeCommand(record);
+    }
+    out.close();
+
+    if (aofFile != nullptr) {
+        fclose(aofFile);
+    }
+    aofFile = fopen(AOF_PATH, "w"); // "w" truncates the existing AOF
+    fclose(aofFile);
+    aofFile = fopen(AOF_PATH, "a"); // reopen in append mode for future writes
+}
+
+// Startup recovery, step 1: load the last snapshot (if any) directly into
+// store/lruList - bypassing handleCommand's SET path on purpose, since
+// plain SET always clears expireAt, which would wipe the very TTL we're
+// trying to restore here.
+void loadSnapshot() {
+    ifstream in(SNAPSHOT_PATH, ios::binary);
+    if (!in.is_open()) {
+        return;
+    }
+    string contents((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    size_t offset = 0;
+    while (offset < contents.size()) {
+        string remaining = contents.substr(offset);
+        ParseResult pr = tryParseCommand(remaining);
+        if (pr.status != PARSE_COMPLETE || pr.args.size() != 3) {
+            break;
+        }
+        string key = pr.args[0];
+        Entry e;
+        e.value = pr.args[1];
+        e.expireAt = stoll(pr.args[2]);
+        lruList.push_front(key);
+        e.lruIt = lruList.begin();
+        store[key] = e;
+        offset += pr.bytesConsumed;
+    }
+}
+
 // Flip a fd into non-blocking mode.
 // Needed for server_fd AND every client_fd, so pulled into a helper
 // instead of repeating the fcntl dance each time.
@@ -362,6 +495,20 @@ bool setNonBlocking(int fd)
 
 int main()
 {
+    // CHANGED: recovery happens before anything else - load the last
+    // snapshot (fast bulk restore), then replay whatever AOF entries
+    // happened after that snapshot was taken. Order matters: snapshot
+    // gives the base state, AOF replay catches it up to where it was
+    // right before the process died.
+    loadSnapshot();
+    replayAof();
+    printf("recovered %zu key(s) from disk\n", store.size());
+
+    // Open the AOF in append mode for all future live writes. Any old
+    // content was either just replayed above, or already truncated by
+    // the last saveSnapshot() call - either way, appending from here on
+    // is correct.
+    aofFile = fopen(AOF_PATH, "a");
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0); // ipv4 , tcp, default protocol tcp
     if (server_fd == -1)
@@ -537,7 +684,16 @@ int main()
 
                             // PARSE_COMPLETE: consume it and dispatch.
                             clientBuffers[fd].erase(0, pr.bytesConsumed);
+                            string cmdUpper = toUpper(pr.args[0]);
                             string reply = handleCommand(pr.args);
+
+                            // CHANGED: durability - log to the AOF BEFORE
+                            // acking the client, so "client got +OK"
+                            // implies "this write survives a crash".
+                            if (isWriteCommand(cmdUpper) && !reply.empty() && reply[0] != '-') {
+                                logWrite(pr.args);
+                            }
+
                             write(fd, reply.c_str(), reply.size());
                         }
 

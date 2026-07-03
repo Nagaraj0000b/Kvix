@@ -393,9 +393,76 @@ set n 5 ; expire n 100 ; incr n ; ttl n -> 100 (TTL preserved across INCR)
 
 ---
 
+## Milestone 8 — persistence: AOF + snapshot, crash recovery verified
+
+**The problem this solves:** everything built through Milestone 7 lives
+only in RAM. A crash or `kill -9` loses it all instantly. This is the same
+problem a database's write-ahead log + checkpointing solves — this
+milestone builds the same idea at a much smaller scale (blueprint §7 calls
+this out directly: "WAL / checkpointing under a different name").
+
+**Built (`main.cpp`):**
+- `encodeCommand(args)` — mirrors `tryParseCommand`: encodes a command's
+  args back into the same RESP array-of-bulk-strings shape. One
+  length-prefixed format reused in both directions - reading commands off
+  the wire, and now writing them to disk.
+- `logWrite(args)` — appends the RESP-encoded command to `cppcache.aof`,
+  then `fflush` + `fsync`s it to physical disk **before** the client gets
+  its reply. This is "always fsync" durability: if the client saw `+OK`,
+  that write is guaranteed to survive a crash. Deliberately the slowest of
+  Redis's three `appendfsync` modes (`always`/`everysec`/`no`) but the
+  simplest to reason about and verify - chosen on purpose for this stage,
+  documented as the durability-vs-performance tradeoff it is.
+- `isWriteCommand(cmd)` — only `SET`/`DEL`/`EXPIRE`/`INCR`/`FLUSHALL`
+  actually mutate state, so only those get logged; reads never do.
+- New `SAVE` command → `saveSnapshot()`: dumps every live (non-expired)
+  key as a `[key, value, expireAt]` RESP record to `cppcache.snapshot`,
+  then truncates the AOF - the snapshot now covers everything up to that
+  point, so old AOF entries would just be redundant replay on top of it.
+- Startup recovery, in order: `loadSnapshot()` (fast bulk restore of the
+  last checkpoint) then `replayAof()` (replays whatever writes happened
+  *after* that snapshot, through the normal `handleCommand` path, catching
+  state up to the moment the process died).
+
+**Subtlety that would have been a silent bug:** `loadSnapshot()` builds
+`Entry` structs directly and inserts into `store`/`lruList` itself,
+instead of routing restored keys through `handleCommand`'s `SET` path -
+because plain `SET` always resets `expireAt` to `0`. Using it to restore
+snapshot data would have silently wiped every TTL on every restart.
+
+**Documented simplification:** both `loadSnapshot()` and `replayAof()`
+call `.substr()` on the remaining buffer each loop iteration, making
+replay O(n²) in file size overall. Fine for a startup-only replay at this
+project's scale; would need a real cursor-based version (no copying) to
+scale to a large AOF.
+
+**Verified, in sequence, using real `kill -9` (not a clean shutdown):**
+```
+set a 1 ; set b 2 ; expire b 500
+kill -9 <pid>                        -> process actually dead, port free
+(restart)
+get a -> "1"   get b -> "2"   ttl b -> 499   (AOF replay rebuilt everything)
+
+save                                  -> OK
+wc -c cppcache.aof                    -> 0 (truncated)
+xxd cppcache.snapshot                 -> both keys present, b's expireAt timestamp intact
+
+set c 3                               (written AFTER the snapshot)
+kill -9 <pid>
+(restart)
+keys *  -> a, b, c                    (a/b from snapshot, c from AOF replay on top)
+```
+This satisfies the blueprint's Week 3 definition-of-done milestone: kill
+the server mid-run, restart, data survives.
+
+---
+
 ## Next up
 
-Week 3 (per blueprint): persistence — AOF (append-only log of every
-write) + snapshot dump/load, with crash recovery verified by killing the
-server mid-run and restarting. Also: start GoogleTest for the parser,
-store, and LRU (deferred from Week 2).
+Refactor into the SOLID command-pattern folder structure described in the
+blueprint (§6) if there's time before Week 4, then: benchmark with
+`redis-benchmark` or a custom client, write the README (features,
+architecture diagram, design decisions, benchmarks, "what I'd do next"),
+and pre-write answers to all of §11's interview questions. GoogleTest for
+the parser/store/LRU is still deferred and worth picking up if time
+allows.

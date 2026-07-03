@@ -538,10 +538,64 @@ could point it at `src/protocol/RespParser` and grow into real unit tests.)*
 
 ---
 
+## Milestone 10 — benchmark with redis-benchmark
+
+**Goal:** get a real ops/sec number, not just "commands are correct." Because
+the server speaks real RESP, the real `redis-benchmark` tool (ships with
+`redis-tools`) can drive it unmodified - a credibility signal on its own.
+
+**How I ran it:**
+1. Built an **optimized** binary (`-O2`, not the plain debug build):
+   `g++ -std=c++17 -O2 -I src $(find src -name '*.cpp') -o cppcache`
+2. Started the server, then pointed the load generator at it:
+   `redis-benchmark -p 6380 -t <commands> -n <requests> -c 50 -q`
+   - `-c 50` = 50 concurrent client connections (the real test of the
+     single-threaded epoll loop serving many clients at once)
+   - `-t set,get,...` = only test commands we actually implement
+
+**Gotcha #1 - `ping` aborted the whole run.** `redis-benchmark`'s default
+`PING_INLINE` test uses Redis's *inline* protocol (`PING\r\n`), not a RESP
+array. Our parser only accepts arrays (must start with `*`), so it correctly
+returned a protocol error and closed the connection - which killed the
+benchmark. Fix: drop `ping` from `-t`; `SET`/`GET`/`INCR` all use RESP arrays
+and work fine. (There's also a harmless "Could not fetch server CONFIG"
+warning because we don't implement `CONFIG` - benchmark continues anyway.)
+
+**Gotcha #2 - SET was absurdly slow (~200 rps), which turned out to be the
+single most instructive result in the project, not a bug.** It's the
+"always fsync" AOF durability cost, measured. So I benchmarked the two paths
+separately:
+
+| Path | Throughput | p50 latency | Why |
+|---|---|---|---|
+| **GET** (read) | **~173,600 ops/sec** | 0.12 ms | pure epoll loop, no disk touched |
+| **SET** (write) | **~201 ops/sec** | ~239 ms | `fsync()` to physical disk on *every* write |
+
+(GET run at `-n 100000`; SET at `-n 2000` because at 200/sec a full 100k run
+would take ~8 minutes.)
+
+**Why the ~860x gap is exactly the durability-vs-performance tradeoff:** the
+only difference between a GET and a SET code path is that SET also does
+mutate-map (fast) + `fwrite` (fast) + `fflush` + **`fsync`**. On WSL2 an
+`fsync` costs several ms, and `1 / ~5ms ≈ 200/sec` - the math matches the
+measured number exactly, proving `fsync` is the entire bottleneck. This is
+literally interview Q7 (AOF durability vs performance) with a number attached:
+we built Redis's `appendfsync=always` mode - safest (if the client saw +OK,
+it's on disk), slowest. `everysec` (batch fsyncs on a 1s timer) would push
+writes into the tens of thousands/sec while risking at most ~1s of data on a
+crash - a concrete "what I'd do next."
+
+**What GET's 173k proves:** the single-threaded epoll design really does serve
+50 concurrent connections at ~173k ops/sec with 0.12ms median latency - the
+"why single-threaded event loop" claim, now backed by evidence.
+
+---
+
 ## Next up
 
-Week 4 harden & prepare (per blueprint): benchmark with `redis-benchmark`
-(record ops/sec), write the README (§10: features, architecture diagram,
-design decisions, benchmarks, "what I'd do next"), and pre-write answers to
-all 12 of §11's interview questions. GoogleTest for the parser/store/LRU is
-still deferred and now easier to add, since each layer is its own unit.
+Week 4 harden & prepare (per blueprint): write the README (§10: features,
+architecture diagram, design decisions incl. the benchmark numbers above,
+"what I'd do next"), and pre-write answers to all 12 of §11's interview
+questions. Optional high-value feature: a configurable AOF fsync policy
+(`always` vs `everysec`) - would boost the SET benchmark massively and
+enrich the durability story. GoogleTest for parser/store/LRU still deferred.

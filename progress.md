@@ -591,11 +591,34 @@ crash - a concrete "what I'd do next."
 
 ---
 
+## Milestone 11 — README + interview-prep docs
+
+**Built:** the two "harden & prepare" deliverables from blueprint §10/§11
+(both are docs the blueprint delegates to Claude, but the design-decision and
+answer content is what gets said out loud in interviews, so it's written to be
+internalized, not just filed).
+
+- **`README.md`** — pitch, feature list, an ASCII architecture diagram + the
+  full `SET name nagaraj` request flow, a Design Decisions section (single-
+  threaded epoll, lazy+active TTL, O(1) LRU, AOF+snapshot durability) with the
+  honest simplifications listed, build & run (both g++ and CMake), the
+  benchmark table, and a "What I'd do next" section.
+- **`INTERVIEW.md`** — draft answers to all 12 of §11's questions, each tied to
+  code actually written, plus a rehearsable 3-minute codebase walkthrough.
+
+Verified the README's build command (`g++ -std=c++17 -O2 -I src $(find src
+-name '*.cpp') -o cppcache`) still produces a working binary, so the
+instructions are accurate.
+
+**Skipped on purpose (user's call):** the configurable AOF fsync-policy feature
+and the GoogleTest suite. Both remain listed under "what I'd do next".
+
+---
+
 ## Next up
 
-Week 4 harden & prepare (per blueprint): write the README (§10: features,
-architecture diagram, design decisions incl. the benchmark numbers above,
-"what I'd do next"), and pre-write answers to all 12 of §11's interview
-questions. Optional high-value feature: a configurable AOF fsync policy
-(`always` vs `everysec`) - would boost the SET benchmark massively and
-enrich the durability story. GoogleTest for parser/store/LRU still deferred.
+The core project is complete against the blueprint's definition of done
+(§13): redis-cli works, TTL + LRU verified, kill -9 recovery works, benchmark
+recorded, architecture documented, all §11 questions answered. Remaining
+optional polish if desired: a photographed hand-drawn architecture diagram for
+`docs/`, the AOF fsync-policy feature, and a GoogleTest suite.

@@ -5,3 +5,4 @@ test_resp
 cppcache.aof
 cppcache.snapshot
 build/
+INTERVIEW.md
